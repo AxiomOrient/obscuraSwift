@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+Artifacts/
+Reports/
+.DS_Store
+*.xcodeproj/
+xcuserdata/
+Vendor/Obscura/target/
+Tests/**/__pycache__/
+*.pyc
+.cache/
+.verification/

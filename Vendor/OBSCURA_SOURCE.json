@@ -1,0 +1,8 @@
+{
+  "upstream": "https://github.com/h4ckf0r0day/obscura",
+  "sourceArchive": "obscura-main(2).zip",
+  "sourceArchiveSHA256": "bd474a7d743d6229ac369b435e5ca862e20ea1836266db64bb21047e10b02268",
+  "gitRevision": null,
+  "policy": "immutable-vendored-source",
+  "notes": "The vendored source is used as-is. Product changes must not modify files under Vendor/Obscura."
+}

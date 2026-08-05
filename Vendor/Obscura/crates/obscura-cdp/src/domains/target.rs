@@ -1,0 +1,385 @@
+use serde_json::{json, Value};
+
+use crate::dispatch::CdpContext;
+use crate::types::CdpEvent;
+use crate::util::url_is_file_scheme;
+
+pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Result<Value, String> {
+    match method {
+        "setDiscoverTargets" => {
+            ctx.pending_events.push(CdpEvent::new(
+                "Target.targetCreated",
+                json!({
+                    "targetInfo": {
+                        "targetId": "browser",
+                        "type": "browser",
+                        "title": "",
+                        "url": "",
+                        "attached": true,
+                        "canAccessOpener": false,
+                        "browserContextId": "",
+                    }
+                }),
+            ));
+            for page in &ctx.pages {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.targetCreated",
+                    json!({
+                        "targetInfo": {
+                            "targetId": page.id,
+                            "type": "page",
+                            "title": page.title,
+                            "url": page.url_string(),
+                            "attached": false,
+                            "canAccessOpener": false,
+                            "browserContextId": page.context.id,
+                        }
+                    }),
+                ));
+            }
+            Ok(json!({}))
+        }
+        "getTargets" => {
+            let targets: Vec<Value> = ctx
+                .pages
+                .iter()
+                .map(|page| {
+                    json!({
+                        "targetId": page.id,
+                        "type": "page",
+                        "title": page.title,
+                        "url": page.url_string(),
+                        "attached": true,
+                        "canAccessOpener": false,
+                        "browserContextId": page.context.id,
+                    })
+                })
+                .collect();
+            Ok(json!({ "targetInfos": targets }))
+        }
+        "createTarget" => {
+            let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+            let context_id = params.get("browserContextId").and_then(|v| v.as_str());
+            let context = match context_id {
+                Some(id) => ctx
+                    .browser_context(id)
+                    .ok_or_else(|| format!("Browser context not found: {}", id))?,
+                None => &ctx.default_context,
+            };
+
+            // Same gate as Page.navigate (GHSA-q55h-vfv9-qcr5). Without this,
+            // a CDP client can call Target.createTarget {url:"file:///etc/passwd"}
+            // and then Runtime.evaluate the body off the created target,
+            // bypassing the page-domain check entirely.
+            if url_is_file_scheme(url) && !context.allow_file_access {
+                return Err(
+                    "Target.createTarget to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
+                );
+            }
+
+            let page_id = ctx.create_page_in_context(context_id)?;
+            let session_id = format!("{}-session", page_id);
+
+            if let Some(page) = ctx.get_page_mut(&page_id) {
+                if url == "about:blank" || url.is_empty() {
+                    page.navigate_blank();
+                } else {
+                    let _ = page.navigate(url).await;
+                }
+            }
+
+            ctx.sessions.insert(session_id.clone(), page_id.clone());
+
+            if let Some(page) = ctx.get_page(&page_id) {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.targetCreated",
+                    json!({
+                        "targetInfo": {
+                            "targetId": page_id,
+                            "type": "page",
+                            "title": page.title,
+                            "url": page.url_string(),
+                            "attached": false,
+                            "canAccessOpener": false,
+                            "browserContextId": page.context.id,
+                        }
+                    }),
+                ));
+            }
+
+            if let Some(page) = ctx.get_page(&page_id) {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.attachedToTarget",
+                    json!({
+                        "sessionId": session_id,
+                        "targetInfo": {
+                            "targetId": page_id,
+                            "type": "page",
+                            "title": page.title,
+                            "url": page.url_string(),
+                            "attached": true,
+                            "canAccessOpener": false,
+                            "browserContextId": page.context.id,
+                        },
+                        "waitingForDebugger": false,
+                    }),
+                ));
+            }
+
+            Ok(json!({ "targetId": page_id }))
+        }
+        "attachToBrowserTarget" => {
+            // Playwright calls this on connect to obtain a session for the
+            // implicit "browser" target. Returning Unknown method aborts
+            // the connect handshake before any user code runs.
+            let session_id = "browser-session".to_string();
+            ctx.sessions.insert(session_id.clone(), "browser".to_string());
+
+            ctx.pending_events.push(CdpEvent::new(
+                "Target.attachedToTarget",
+                json!({
+                    "sessionId": session_id,
+                    "targetInfo": {
+                        "targetId": "browser",
+                        "type": "browser",
+                        "title": "",
+                        "url": "",
+                        "attached": true,
+                        "canAccessOpener": false,
+                        "browserContextId": "",
+                    },
+                    "waitingForDebugger": false,
+                }),
+            ));
+
+            Ok(json!({ "sessionId": session_id }))
+        }
+        "attachToTarget" => {
+            let target_id = params.get("targetId").and_then(|v| v.as_str())
+                .ok_or("targetId required")?;
+            let session_id = format!("{}-session", target_id);
+            ctx.sessions.insert(session_id.clone(), target_id.to_string());
+
+            if let Some(page) = ctx.get_page(target_id) {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.attachedToTarget",
+                    json!({
+                        "sessionId": session_id,
+                        "targetInfo": {
+                            "targetId": target_id,
+                            "type": "page",
+                            "title": page.title,
+                            "url": page.url_string(),
+                            "attached": true,
+                            "canAccessOpener": false,
+                            "browserContextId": page.context.id,
+                        },
+                        "waitingForDebugger": false,
+                    }),
+                ));
+            }
+
+            Ok(json!({ "sessionId": session_id }))
+        }
+        "closeTarget" => {
+            let target_id = params.get("targetId").and_then(|v| v.as_str())
+                .ok_or("targetId required")?;
+            let session_id = format!("{}-session", target_id);
+
+            ctx.pending_events.push(CdpEvent::new(
+                "Target.detachedFromTarget",
+                json!({
+                    "sessionId": session_id,
+                    "targetId": target_id,
+                }),
+            ));
+            ctx.pending_events.push(CdpEvent::new(
+                "Target.targetDestroyed",
+                json!({ "targetId": target_id }),
+            ));
+
+            ctx.remove_page(target_id);
+            Ok(json!({ "success": true }))
+        }
+        "setAutoAttach" => Ok(json!({})),
+        // No multi-target lifecycle to manage: obscura runs one page per session.
+        // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
+        "detachFromTarget" => Ok(json!({})),
+        "activateTarget" => Ok(json!({})),
+        "getBrowserContexts" => {
+            let mut ids: Vec<&String> = ctx.browser_contexts.keys().collect();
+            ids.sort();
+            Ok(json!({ "browserContextIds": ids }))
+        }
+        "createBrowserContext" => {
+            let id = ctx.create_browser_context();
+            Ok(json!({ "browserContextId": id }))
+        }
+        "disposeBrowserContext" => {
+            let context_id = params
+                .get("browserContextId")
+                .and_then(|v| v.as_str())
+                .ok_or("browserContextId required")?;
+            let sessions: Vec<(String, String)> = ctx
+                .sessions
+                .iter()
+                .filter_map(|(session_id, page_id)| {
+                    ctx.get_page(page_id)
+                        .filter(|page| page.context.id == context_id)
+                        .map(|_| (session_id.clone(), page_id.clone()))
+                })
+                .collect();
+            let page_ids = ctx.dispose_browser_context(context_id)?;
+            for (session_id, page_id) in sessions {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.detachedFromTarget",
+                    json!({ "sessionId": session_id, "targetId": page_id }),
+                ));
+            }
+            for page_id in page_ids {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.targetDestroyed",
+                    json!({ "targetId": page_id }),
+                ));
+            }
+            Ok(json!({}))
+        }
+        "getTargetInfo" => {
+            let target_id = params.get("targetId").and_then(|v| v.as_str());
+            match target_id {
+                Some(id) => {
+                    let page = ctx.get_page(id).ok_or("Target not found")?;
+                    Ok(json!({
+                        "targetInfo": {
+                            "targetId": id,
+                            "type": "page",
+                            "title": page.title,
+                            "url": page.url_string(),
+                            "attached": true,
+                            "canAccessOpener": false,
+                            "browserContextId": page.context.id,
+                        }
+                    }))
+                }
+                None => {
+                    // canAccessOpener is required on every TargetInfo per the
+                    // CDP spec. Strict clients (chromiumoxide) panic if it's
+                    // missing. The browser target itself has no opener.
+                    Ok(json!({
+                        "targetInfo": {
+                            "targetId": "browser",
+                            "type": "browser",
+                            "title": "",
+                            "url": "",
+                            "attached": true,
+                            "canAccessOpener": false,
+                        }
+                    }))
+                }
+            }
+        }
+        _ => Err(format!("Unknown Target method: {}", method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn browser_contexts_are_real_and_do_not_clear_default_cookies() {
+        let mut ctx = CdpContext::new();
+        ctx.default_context.cookie_jar.set_cookie(
+            "sid=default",
+            &url::Url::parse("https://example.com").unwrap(),
+        );
+
+        let created = handle("createBrowserContext", &json!({}), &mut ctx)
+            .await
+            .expect("context creation should succeed");
+        let context_id = created["browserContextId"].as_str().unwrap();
+        assert_ne!(context_id, "default");
+        assert!(ctx.browser_context(context_id).unwrap().cookie_jar.get_all_cookies().is_empty());
+        assert_eq!(ctx.default_context.cookie_jar.get_all_cookies().len(), 1);
+
+        let listed = handle("getBrowserContexts", &json!({}), &mut ctx)
+            .await
+            .expect("context listing should succeed");
+        assert_eq!(listed["browserContextIds"], json!([context_id]));
+    }
+
+    #[tokio::test]
+    async fn disposing_context_removes_only_its_pages() {
+        let mut ctx = CdpContext::new();
+        let context_id = ctx.create_browser_context();
+        let isolated_page = ctx.create_page_in_context(Some(&context_id)).unwrap();
+        let default_page = ctx.create_page();
+
+        handle(
+            "disposeBrowserContext",
+            &json!({"browserContextId": context_id}),
+            &mut ctx,
+        )
+        .await
+        .expect("context disposal should succeed");
+
+        assert!(ctx.get_page(&isolated_page).is_none());
+        assert!(ctx.get_page(&default_page).is_some());
+        assert!(ctx.browser_contexts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_to_browser_target_returns_session_id() {
+        let mut ctx = CdpContext::new();
+        let result = handle("attachToBrowserTarget", &json!({}), &mut ctx)
+            .await
+            .expect("attachToBrowserTarget should succeed");
+
+        assert_eq!(result["sessionId"], "browser-session");
+        assert_eq!(
+            ctx.sessions.get("browser-session").map(String::as_str),
+            Some("browser")
+        );
+
+        // Playwright/Puppeteer expect a Target.attachedToTarget event before
+        // they finish wiring up the session — without it the connect promise
+        // hangs.
+        let attached_evt = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Target.attachedToTarget")
+            .expect("attachedToTarget event must be emitted");
+        assert_eq!(attached_evt.params["sessionId"], "browser-session");
+        assert_eq!(attached_evt.params["targetInfo"]["type"], "browser");
+    }
+
+    #[tokio::test]
+    async fn unknown_target_method_still_errors() {
+        let mut ctx = CdpContext::new();
+        let err = handle("notARealMethod", &json!({}), &mut ctx)
+            .await
+            .expect_err("unknown methods must surface as errors");
+        assert!(err.contains("Unknown Target method"));
+    }
+
+    /// Regression for #122 item 5: every TargetInfo payload must carry the
+    /// `canAccessOpener` field. The browser-target branch of getTargetInfo
+    /// (no targetId passed → no page) used to omit it; strict CDP clients
+    /// like chromiumoxide panic when the field is missing.
+    #[tokio::test]
+    async fn get_target_info_browser_target_includes_can_access_opener() {
+        let mut ctx = CdpContext::new();
+        // No targetId → falls through to the browser-target branch.
+        let result = handle("getTargetInfo", &json!({}), &mut ctx)
+            .await
+            .expect("getTargetInfo with no targetId must return browser info");
+
+        let info = &result["targetInfo"];
+        assert_eq!(info["type"], "browser", "must be the browser target");
+        assert!(
+            info.get("canAccessOpener").is_some(),
+            "canAccessOpener must be present on every TargetInfo, got: {result}"
+        );
+        assert_eq!(info["canAccessOpener"], false);
+    }
+}
