@@ -108,6 +108,11 @@ struct FixtureExecutable {
     return value
   }
 
+  func forceTerminate() -> Bool {
+    guard let pid = recordedPID() else { return false }
+    return kill(pid, SIGKILL) == 0
+  }
+
   func waitUntilStopped(timeout: Duration = .seconds(2)) async -> Bool {
     guard let pid = recordedPID() else { return true }
     let clock = ContinuousClock()
@@ -276,6 +281,60 @@ actor GatedStopProcess: EngineProcessHandle {
 
   func stop() async throws -> EngineExit {
     await gate.waitForRelease()
+    return try await base.stop()
+  }
+
+  nonisolated func terminateImmediately() { base.terminateImmediately() }
+}
+
+/// Holds only the first process-stop completion so a recovery cleanup can
+/// finish while the original terminal finalizer remains suspended.
+actor FirstStopGate {
+  private var firstStopClaimed = false
+  private var firstStopEntered = false
+  private var released = false
+  private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+  func waitForFirstStopRelease() async {
+    guard !firstStopClaimed else { return }
+    firstStopClaimed = true
+    firstStopEntered = true
+    if released { return }
+    await withCheckedContinuation { continuation in
+      if released {
+        continuation.resume()
+      } else {
+        releaseWaiters.append(continuation)
+      }
+    }
+  }
+
+  func firstStopWasEntered() -> Bool { firstStopEntered }
+
+  func releaseFirstStop() {
+    guard !released else { return }
+    released = true
+    let releaseWaiters = releaseWaiters
+    self.releaseWaiters.removeAll(keepingCapacity: false)
+    for waiter in releaseWaiters { waiter.resume() }
+  }
+}
+
+actor FirstStopGatedProcess: EngineProcessHandle {
+  private let base: any EngineProcessHandle
+  private let gate: FirstStopGate
+
+  init(base: any EngineProcessHandle, gate: FirstStopGate) {
+    self.base = base
+    self.gate = gate
+  }
+
+  func waitForExit() async throws -> EngineExit { try await base.waitForExit() }
+  func isRunning() async -> Bool { await base.isRunning() }
+  func diagnosticSnapshot() async -> String { await base.diagnosticSnapshot() }
+
+  func stop() async throws -> EngineExit {
+    await gate.waitForFirstStopRelease()
     return try await base.stop()
   }
 

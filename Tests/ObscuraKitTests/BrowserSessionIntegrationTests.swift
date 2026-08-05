@@ -582,6 +582,194 @@ final class BrowserSessionIntegrationTests: XCTestCase, @unchecked Sendable {
     XCTAssertTrue(stopped)
   }
 
+  func testRecoveryIgnoresStaleTerminalCleanupCompletion() async throws {
+    let fixture = try FixtureExecutable.make(delaySeconds: 1.0)
+    defer { fixture.forceCleanup() }
+    let stopGate = FirstStopGate()
+    let launchGate = ReplacementLaunchGate()
+    let dependencies = RuntimeDependencies(
+      launchProcess: { launch in
+        let process = try await launchGate.launch(launch)
+        return FirstStopGatedProcess(base: process, gate: stopGate)
+      },
+      controlPlane: LoopbackEngineControlPlane(),
+      makeTransport: { endpoint, limit in
+        try FoundationWebSocketTransport(endpoint: endpoint, maximumMessageBytes: limit)
+      }
+    )
+    let configuration = try fixture.configuration(operationTimeout: .seconds(2))
+    let original = try await BrowserSession.launch(configuration, dependencies: dependencies)
+    let checkpoint = try await original.checkpoint()
+
+    let terminalOperation = Task { () throws -> Void in
+      _ = try await original.evaluate(
+        "__fixture_delay__", as: String.self, timeout: .milliseconds(50)
+      )
+    }
+    let terminalCleanupStarted = await eventually {
+      await stopGate.firstStopWasEntered()
+    }
+    XCTAssertTrue(terminalCleanupStarted)
+    guard terminalCleanupStarted else { return }
+
+    let recovery = Task { try await original.recover(from: checkpoint) }
+    let replacementStarted = await eventually { await launchGate.didStartReplacement() }
+    XCTAssertTrue(replacementStarted)
+    do {
+      _ = try await original.recover(from: checkpoint)
+      XCTFail("expected duplicate recovery rejection")
+    } catch {
+      XCTAssertEqual(
+        error as? ObscuraError,
+        .invalidState("recovery is only valid for a quarantined session")
+      )
+    }
+    let launchCount = await launchGate.replacementLaunchCount()
+    XCTAssertEqual(launchCount, 2)
+
+    await stopGate.releaseFirstStop()
+    do {
+      _ = try await terminalOperation.value
+      XCTFail("expected terminal operation failure")
+    } catch {
+      XCTAssertEqual(error as? ObscuraError, .operationTimedOut("Runtime.evaluate"))
+    }
+    let duringRecovery = await original.snapshot()
+    XCTAssertEqual(duringRecovery.phase, .recovering)
+
+    await launchGate.releaseReplacement()
+    let replacement = try await recovery.value
+    let originalAfterRecovery = await original.snapshot()
+    let replacementAfterRecovery = await replacement.snapshot()
+    XCTAssertEqual(originalAfterRecovery.phase, .closed)
+    XCTAssertEqual(replacementAfterRecovery.phase, .ready)
+    XCTAssertFalse(originalAfterRecovery.failure?.contains("invalid state transition") == true)
+    await replacement.close()
+    let stopped = await fixture.waitUntilStopped(timeout: .seconds(3))
+    XCTAssertTrue(stopped)
+  }
+
+  func testRecoveryIgnoresStaleSupervisionCleanupCompletion() async throws {
+    let fixture = try FixtureExecutable.make()
+    defer { fixture.forceCleanup() }
+    let stopGate = FirstStopGate()
+    let launchGate = ReplacementLaunchGate()
+    let dependencies = RuntimeDependencies(
+      launchProcess: { launch in
+        let process = try await launchGate.launch(launch)
+        return FirstStopGatedProcess(base: process, gate: stopGate)
+      },
+      controlPlane: LoopbackEngineControlPlane(),
+      makeTransport: { endpoint, limit in
+        try FoundationWebSocketTransport(endpoint: endpoint, maximumMessageBytes: limit)
+      }
+    )
+    let original = try await BrowserSession.launch(
+      try fixture.configuration(), dependencies: dependencies
+    )
+    let checkpoint = try await original.checkpoint()
+
+    XCTAssertTrue(fixture.forceTerminate())
+    let supervisionCleanupStarted = await eventually {
+      await stopGate.firstStopWasEntered()
+    }
+    XCTAssertTrue(supervisionCleanupStarted)
+    guard supervisionCleanupStarted else {
+      XCTFail("supervision cleanup did not start; phase=\(await original.snapshot().phase)")
+      return
+    }
+
+    let recovery = Task { try await original.recover(from: checkpoint) }
+    let replacementStarted = await eventually { await launchGate.didStartReplacement() }
+    XCTAssertTrue(replacementStarted)
+    do {
+      _ = try await original.recover(from: checkpoint)
+      XCTFail("expected duplicate recovery rejection")
+    } catch {
+      XCTAssertEqual(
+        error as? ObscuraError,
+        .invalidState("recovery is only valid for a quarantined session")
+      )
+    }
+    let launchCount = await launchGate.replacementLaunchCount()
+    XCTAssertEqual(launchCount, 2)
+
+    await stopGate.releaseFirstStop()
+    let staleFinalizerIgnored = await eventually { await original.snapshot().phase == .recovering }
+    XCTAssertTrue(staleFinalizerIgnored)
+
+    await launchGate.releaseReplacement()
+    let replacement = try await recovery.value
+    let originalAfterRecovery = await original.snapshot()
+    let replacementAfterRecovery = await replacement.snapshot()
+    XCTAssertEqual(originalAfterRecovery.phase, .closed)
+    XCTAssertEqual(replacementAfterRecovery.phase, .ready)
+    XCTAssertFalse(originalAfterRecovery.failure?.contains("invalid state transition") == true)
+    await replacement.close()
+    let stopped = await fixture.waitUntilStopped(timeout: .seconds(3))
+    XCTAssertTrue(stopped)
+  }
+
+  func testRecoveryOwnedShutdownFailureRemainsVisible() async throws {
+    let fixture = try FixtureExecutable.make(delaySeconds: 1.0)
+    defer { fixture.forceCleanup() }
+    let stopGate = FirstStopGate()
+    let dependencies = RuntimeDependencies(
+      launchProcess: { launch in
+        let process = try await EngineProcess.launch(launch)
+        let failing = StopFailingProcess(base: process)
+        return FirstStopGatedProcess(base: failing, gate: stopGate)
+      },
+      controlPlane: LoopbackEngineControlPlane(),
+      makeTransport: { endpoint, limit in
+        try FoundationWebSocketTransport(endpoint: endpoint, maximumMessageBytes: limit)
+      }
+    )
+    let original = try await BrowserSession.launch(
+      try fixture.configuration(operationTimeout: .seconds(2)), dependencies: dependencies
+    )
+    let checkpoint = try await original.checkpoint()
+    let terminalOperation = Task { () throws -> Void in
+      _ = try await original.evaluate(
+        "__fixture_delay__", as: String.self, timeout: .milliseconds(50)
+      )
+    }
+    let terminalCleanupStarted = await eventually {
+      await stopGate.firstStopWasEntered()
+    }
+    XCTAssertTrue(terminalCleanupStarted)
+    guard terminalCleanupStarted else { return }
+
+    let recovery = Task { () throws -> BrowserSession in
+      try await original.recover(from: checkpoint)
+    }
+    do {
+      _ = try await recovery.value
+      XCTFail("expected recovery shutdown failure")
+    } catch {
+      guard case .recoveryFailed(_, let recoveryDescription) = error as? ObscuraError else {
+        return XCTFail("unexpected recovery error: \(error)")
+      }
+      XCTAssertTrue(recoveryDescription.contains("synthetic stop failure"))
+    }
+
+    await stopGate.releaseFirstStop()
+    do {
+      _ = try await terminalOperation.value
+      XCTFail("expected terminal operation failure")
+    } catch {
+      guard case .recoveryFailed(_, let cleanupDescription) = error as? ObscuraError else {
+        return XCTFail("unexpected terminal error: \(error)")
+      }
+      XCTAssertTrue(cleanupDescription.contains("synthetic stop failure"))
+    }
+    let snapshot = await original.snapshot()
+    XCTAssertEqual(snapshot.phase, .closed)
+    XCTAssertTrue(snapshot.failure?.contains("synthetic stop failure") == true)
+    let stopped = await fixture.waitUntilStopped(timeout: .seconds(3))
+    XCTAssertTrue(stopped)
+  }
+
   func testSessionSnapshotStreamEmitsExplicitTransitionsAndFinishes() async throws {
     let fixture = try FixtureExecutable.make()
     defer { fixture.forceCleanup() }

@@ -523,10 +523,9 @@ public actor BrowserSession {
     }
     if effects.contains(.shutdown) {
       let shutdownError = await shutdownResources()
-      if let transitionFailure = recordShutdownResult(
+      if let transitionFailure = recordTerminalShutdownResult(
         shutdownError,
-        context: "finalizing supervised failure",
-        disposition: .quarantined
+        context: "finalizing supervised failure"
       ) {
         surfacedFailure = Self.mergeFailures(
           primary: surfacedFailure,
@@ -604,10 +603,9 @@ public actor BrowserSession {
         supervisionTask?.cancel()
         supervisionTask = nil
         let shutdownError = await shutdownResources()
-        if let transitionFailure = recordShutdownResult(
+        if let transitionFailure = recordTerminalShutdownResult(
           shutdownError,
-          context: "finalizing failed operation \(operation)",
-          disposition: .quarantined
+          context: "finalizing failed operation \(operation)"
         ) {
           surfacedFailure = Self.mergeFailures(
             primary: surfacedFailure,
@@ -886,6 +884,26 @@ public actor BrowserSession {
       )
       return Self.mergeFailures(primary: failure, secondary: invariant)
     }
+  }
+
+  /// A terminal operation or supervision failure owns the quarantined
+  /// shutdown only until another lifecycle action (recovery or close) takes
+  /// over. Actor reentrancy can suspend that finalizer after resources are
+  /// detached, so a late completion must not be interpreted as an invariant
+  /// failure in the new owner phase.
+  @discardableResult
+  private func recordTerminalShutdownResult(
+    _ shutdownError: ObscuraError?,
+    context: String
+  ) -> ObscuraError? {
+    guard state.phase == .quarantined else {
+      return shutdownError
+    }
+    return recordShutdownResult(
+      shutdownError,
+      context: context,
+      disposition: .quarantined
+    )
   }
 
   /// Applies the reducer event corresponding to an already completed
