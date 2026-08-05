@@ -25,6 +25,9 @@ silent fallback. `Vendor/Obscura/target/`, `.build/`, `.cache/`, reports, ZIP fi
 and local credentials are generated or environment-specific. Source publication is
 separate from the Git archive/package gate and from macOS/Linux runtime evidence.
 
+Vendored Obscura provenance and license attribution are recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## 제공 범위
 
 `ObscuraKit`은 한 session에서 한 개의 새 page target을 만들고 제어한다.
