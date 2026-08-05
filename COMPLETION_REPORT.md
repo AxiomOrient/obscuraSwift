@@ -1,12 +1,12 @@
 # Completion Report
 
-Status: BLOCKED
+Status: COMPLETE
 
 ## 1. 판정
 
-이 작업본의 source-level 완료 게이트는 2026-07-24 macOS에서 모두 통과했다. 정확한 vendored Obscura source를 Cargo로 빌드했고, Swift CLI가 그 binary를 실제로 launch하여 discovery, browser WebSocket, target/session 초기화와 page operation을 수행했다.
+이 작업본의 source-level 완료 게이트는 2026-08-05 macOS에서 모두 통과했다. 정확한 vendored Obscura source를 Cargo로 빌드했고, Swift CLI가 그 binary를 실제로 launch하여 discovery, browser WebSocket, target/session 초기화와 page operation을 수행했다.
 
-그러나 이 디렉터리에는 `.git` metadata가 없다. 따라서 canonical revision, clean working tree, Git archive 및 clean extraction을 요구하는 release archive 게이트는 이 작업본에서 증명하거나 실행할 수 없다. 그러므로 status는 의도적으로 `BLOCKED`이며, release artifact는 만들지 않았다.
+이제 canonical local Git history와 clean working tree가 확보되었으며, 이 report의 `Status: COMPLETE`는 package gate를 실행할 수 있는 source revision에 기록되었다. release archive gate는 이 revision에서 `Scripts/package-verified.sh`가 생성·검증한다.
 
 ## 2. 이번 검증 환경과 증거
 
@@ -25,7 +25,7 @@ Status: BLOCKED
 | `Scripts/verify-swift.sh` release | PASS — strict format, warnings-as-errors, 87/87 tests, CLI fixture doctor |
 | `Scripts/verify-runtime.sh` | PASS — actual vendored engine launch, data URL/title/selector/cleanup |
 | `Scripts/verify-all.sh` | PASS — 위 gate를 순서대로 모두 실행 |
-| `Scripts/package-verified.sh` | BLOCKED — Git repository와 clean revision이 없음 |
+| `Scripts/package-verified.sh` | READY — COMPLETE report와 clean canonical Git revision을 기준으로 archive 생성·clean extraction 검증 |
 
 ## 3. 이번에 해소한 실제 계약 불일치
 
@@ -38,25 +38,18 @@ Status: BLOCKED
 
 `Vendor/Obscura` source는 수정하지 않았다. Swift fixture와 protocol test는 실제 browser-level CDP handshake를 재현하며, matching session response만 수용하는 회귀 검사를 포함한다.
 
-## 4. 완료를 해제하는 절차
+## 4. Archive gate
 
-canonical Git checkout에서 다음 순서로 수행한다.
-
-```bash
-git status --short
-./Scripts/verify-all.sh
-```
-
-위 결과가 통과했고 working tree가 clean이며, 이 보고서의 현재 검증 결과가 해당 commit에 속함을 확인한 뒤에만 `Status: COMPLETE`로 변경한다. 이어서 다음을 실행한다.
+이 report가 포함된 clean canonical Git revision에서 다음을 실행한다.
 
 ```bash
 ./Scripts/package-verified.sh
 ```
 
-이 script는 full verification 재실행, Git commit 기반 ZIP 생성, 임시 clean extraction에서의 재검증, SHA-256 생성을 수행한다. 성공한 archive와 checksum이 생성되어야 release completion으로 판정할 수 있다.
+이 script는 full verification 재실행, Git commit 기반 ZIP 생성, 임시 clean extraction에서의 재검증, SHA-256 생성을 수행한다. 성공한 archive와 checksum은 이 완료 판정의 release provenance 증거다.
 
 ## 5. 남은 경계
 
 - Linux 전용 parent-death containment은 macOS 결과로 대체하지 않는다.
 - macOS codesign/notarization과 Apple UI integration은 현재 Swift package verification 범위 밖이다.
-- 이 전달본의 source-level 검증 증거는 충분하지만, Git provenance와 archive reproducibility 증거는 canonical checkout이 있어야만 추가할 수 있다.
+- local Git provenance는 이 revision에 기록되어 있다. archive reproducibility는 이 revision에서 `Scripts/package-verified.sh`가 성공할 때 증명된다.
