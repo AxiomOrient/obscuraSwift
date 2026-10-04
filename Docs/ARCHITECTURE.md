@@ -91,3 +91,90 @@ retry, fallback, silent recovery는 없다. recovery는 새 process와 새 conne
 이 package에는 SwiftUI, Observation, TCA target 또는 UI adapter가 없다. core가 제공하는 UI-adjacent surface는 immutable `SessionSnapshot`의 `snapshots()` stream뿐이며, 상위 application이 이를 어떤 UI state model로 변환할지는 이 repository의 contract 밖이다.
 
 핵심 기능이 state, event, effect, failure, regression test에 빠짐없이 연결되는지는 [core contract matrix](CORE_CONTRACT_MATRIX.md)로 추적한다.
+
+## Usage entry points
+
+The examples below run from the repository root. Vendored source, license, provenance and hash requirements remain in [VENDORING.md](VENDORING.md); attribution remains in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+
+## 요구 사항
+
+- Swift 6.2 이상; package manifest는 macOS 13 이상을 선언한다.
+- vendored engine build를 위한 Rust toolchain (`cargo`, `rustc`).
+- integration fixture와 runtime assertion을 위한 Python 3.
+
+POSIX process layer에는 Darwin과 Linux code path가 있다. 다만 Linux parent-death containment 검사는 Linux에서만 실행되며, macOS 결과로 대체되지 않는다.
+
+## 빠른 시작
+
+vendored source를 먼저 검증·빌드한 뒤 CLI doctor를 실행한다.
+
+```bash
+./Scripts/build-vendored-obscura.sh
+swift run -c release obscura-swift doctor --repository-root "$PWD"
+swift run -c release obscura-swift run https://example.com --repository-root "$PWD"
+```
+
+기본 위치가 아닌 engine binary를 사용할 때만 `--engine /absolute/path/to/obscura`를 사용한다. `--engine`과 `--repository-root`는 함께 쓸 수 없다.
+
+## Engine mode
+
+기본은 검증된 vendored Obscura다. 별도 Obscura-compatible binary에는 --engine PATH,
+실제 Google Chrome/Chromium에는 --chrome PATH를 사용한다.
+
+~~~bash
+swift run -c release obscura-swift doctor \
+  --chrome '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+swift run -c release obscura-swift run https://example.com \
+  --chrome '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+~~~
+
+Swift에서는 같은 선택을 명시적으로 표현한다.
+
+~~~swift
+let configuration = try LaunchConfiguration.chrome(
+  executable: URL(fileURLWithPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+)
+let session = try await BrowserSession.launch(configuration)
+~~~
+
+Chrome mode는 독립 temporary profile, --headless=new, loopback-only CDP를 사용한다.
+Chrome 자체의 네트워크 정책이 적용되므로 Obscura 전용 stealth 옵션은 Chrome mode에서 거부된다.
+allowPrivateNetwork도 Chrome mode의 네트워크 정책을 제어하지 않는다.
+
+## Swift 사용
+
+```swift
+import Foundation
+import ObscuraKit
+
+func inspect(repositoryRoot: URL) async throws {
+  let configuration = try LaunchConfiguration(
+    executable: .vendored(repositoryRoot: repositoryRoot)
+  )
+  let session = try await BrowserSession.launch(configuration)
+
+  do {
+    let result = try await session.navigate(
+      to: URL(string: "https://example.com")!,
+      waitUntil: .load
+    )
+    let title = try await session.title()
+    let heading = try await session.locator(try CSSSelector("h1")).textContent()
+    print(result.url, title, heading ?? "")
+    await session.close()
+  } catch {
+    await session.close()
+    throw error
+  }
+}
+```
+
+정상 수명은 소유자가 `await session.close()`로 끝낸다. `deinit`의 강제 종료는 abandoned session의 containment일 뿐, 정상 종료 계약이 아니다.
+
+terminal failure 뒤에는 기존 session을 재사용하지 않는다. checkpoint에는 compatibility와 cookie만 보존되며 DOM, V8 state, listener, timer, navigation은 복원되지 않는다.
+
+```swift
+let checkpoint = try await session.checkpoint()
+let replacement = try await session.recover(from: checkpoint)
+```
